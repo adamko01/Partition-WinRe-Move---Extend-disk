@@ -136,15 +136,6 @@ If a step fails:
 
 There is no automatic partition rollback. Following a destructive-stage failure, further automated changes are blocked. Do not run other partition-management tools concurrently.
 
-## Testing status
-
-- PowerShell syntax parsing passed during development.
-- 22 mocked workflow/security checks passed, including button gating, WinRE mismatches, stale layouts, and encrypted-drive rejection.
-- The free-space display was regression-tested with the reported overflow value and capacities up to 3 TiB.
-- Successful use has been reported in the original user's environment; an exact Windows build and full compatibility matrix have not been recorded.
-
-Mocked checks do not validate real Windows disk operations or every GUI configuration. The development checks are not bundled with this script. Validate your own target environment before production use.
-
 ## Microsoft references
 
 - [Extend a basic or dynamic volume](https://learn.microsoft.com/en-us/windows-server/storage/disk-management/extend-a-basic-volume)
