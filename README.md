@@ -19,6 +19,8 @@ The tool identifies the disk containing the running Windows installation on C:, 
 
 It operates inside running Windows and does not request a reboot or stop application services. This is **not a guarantee of zero downtime** or uninterrupted application performance.
 
+The script does not increase a VMware virtual disk itself. Expand the virtual disk separately and make sure Windows can see the additional capacity before starting.
+
 ## Features
 
 - Guided and quick modes in separate tabs.
@@ -135,6 +137,15 @@ If a step fails:
 4. If partition modification started, inspect Disk Management and `reagentc /info` before deciding how to recover.
 
 There is no automatic partition rollback. Following a destructive-stage failure, further automated changes are blocked. Do not run other partition-management tools concurrently.
+
+## Testing status
+
+- PowerShell syntax parsing passed during development.
+- 22 mocked workflow/security checks passed, including button gating, WinRE mismatches, stale layouts, and encrypted-drive rejection.
+- The free-space display was regression-tested with the reported overflow value and capacities up to 3 TiB.
+- Successful use has been reported in the original user's environment; an exact Windows build and full compatibility matrix have not been recorded.
+
+Mocked checks do not validate real Windows disk operations or every GUI configuration. The development checks are not bundled with this script. Validate your own target environment before production use.
 
 ## Microsoft references
 
