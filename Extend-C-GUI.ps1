@@ -1,8 +1,8 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-Interactive GUI v2.2: extend C: and recreate a standard WinRE partition online.
+Interactive GUI v2.3.1: extend C: and recreate a standard WinRE partition online.
 .DESCRIPTION
 Run in elevated 64-bit Windows PowerShell 5.1 on Windows Server Desktop Experience:
   powershell.exe -NoProfile -STA -File .\Extend-C-GUI.ps1
@@ -10,8 +10,9 @@ Guided mode separates inspection, WinRE matching, BitLocker, disable/preserve,
 extend/rebuild, and enable/validate. Quick mode uses the same steps.
 Analyze is read-only apart from local logs. Extend requires a backup acknowledgement
 and confirmation. No reboot or service stop is requested. No zero-downtime guarantee.
-Scope: current OS on C:, healthy basic GPT disk, EFI + MSR + C: + one standard
-WinRE partition, followed by newly added unallocated space. English REAgentC output
+Scope: current OS on C:, healthy basic GPT or MBR disk. GPT: EFI + MSR + C: +
+WinRE. MBR: active system partition + C: + WinRE (type 0x27), disk <= 2 TiB.
+Both require newly added trailing unallocated space; logical partitions unsupported. English REAgentC output
 is required for fail-closed status parsing. Encrypted/clustered disks are rejected.
 WinRE must initially be enabled; incomplete previous attempts require manual review.
 Only Winre.wim is preserved; do not use on OEM/custom recovery partitions.
@@ -22,7 +23,7 @@ The WIM copy on C: is not a VM backup. No automatic partition rollback is attemp
 After a failure, read the log and inspect the disk before making further changes.
 After success, verify application health. A WinRE boot test needs a maintenance window.
 
-Validation: PowerShell parser plus 22 mocked gate/security cases passed.
+Validation: PowerShell parser and mocked workflow/partition checks; see delivery notes.
 Vendor command references reviewed; NOT execution-tested on Windows.
 Validate on a disposable clone before production use. Do not run concurrent disk tools.
 References:
@@ -103,63 +104,161 @@ function Get-ReInfo {
     }
     [pscustomobject]@{ Enabled=$enabled; Disk=$diskNumber; Partition=$partitionNumber }
 }
+function Get-PartitionKey($Partition, [string]$Style, [switch]$IgnoreSize) {
+    # MBR has no unique partition GUID; never compare empty GUIDs as identities.
+    $type = if ($Style -eq 'GPT') { "$($Partition.Guid):$($Partition.GptType)" } else { "MBR:$([int]$Partition.MbrType)" }
+    $key = "$($Partition.DiskNumber):$($Partition.PartitionNumber):$($Partition.Offset):$type`:$($Partition.IsActive):$($Partition.IsBoot):$($Partition.IsSystem):$($Partition.DriveLetter)"
+    if (-not $IgnoreSize) { $key += ":$($Partition.Size)" }
+    return $key
+}
+function Get-DiskKey($Disk) {
+    $key = "$($Disk.Number):$($Disk.UniqueId):$($Disk.PartitionStyle):$($Disk.Size)"
+    if ($Disk.PartitionStyle -eq 'MBR') { $key += ":$($Disk.Signature)" }
+    return $key
+}
+function Assert-DiskIdentity($Plan) {
+    $d = Get-Disk -Number $Plan.Disk.Number
+    if ((Get-DiskKey $d) -ne $Plan.DiskKey -or $d.IsOffline -or $d.IsReadOnly -or $d.IsClustered -or $d.HealthStatus -ne 'Healthy') {
+        throw 'Disk identity or health changed. Further changes blocked.'
+    }
+}
+function Test-RecoveryType($Partition, [string]$Style) {
+    if ($Style -eq 'GPT') { return ([string]$Partition.GptType).Trim('{}') -eq $script:RecoveryType }
+    return [int]$Partition.MbrType -eq 0x27
+}
+function Assert-Preserved($Plan, $Actual, [switch]$AllowCGrowth) {
+    foreach ($old in $Plan.Parts) {
+        if ($old.PartitionNumber -eq $Plan.Recovery.PartitionNumber) { continue }
+        $same = @($Actual | Where-Object PartitionNumber -eq $old.PartitionNumber)
+        if ($same.Count -ne 1) { throw 'A preserved boot/system/C: partition is missing.' }
+        $ignore = $AllowCGrowth -and $old.PartitionNumber -eq $Plan.C.PartitionNumber
+        if ((Get-PartitionKey $same[0] $Plan.Style -IgnoreSize:$ignore) -ne (Get-PartitionKey $old $Plan.Style -IgnoreSize:$ignore)) {
+            throw "Preserved partition $($old.PartitionNumber) changed unexpectedly."
+        }
+        if ($ignore -and $same[0].Size -le $old.Size) { throw 'C: did not grow as expected.' }
+    }
+}
 function Get-Layout {
     if ($env:SystemDrive -ne 'C:') { throw 'The running Windows installation must be on C:.' }
     $c = Get-Partition -DriveLetter C
     $d = Get-Disk -Number $c.DiskNumber
     $v = Get-Volume -DriveLetter C
-    if ($d.PartitionStyle -ne 'GPT' -or $d.IsOffline -or $d.IsReadOnly -or $d.IsClustered -or
-        $d.HealthStatus -ne 'Healthy' -or $v.HealthStatus -ne 'Healthy' -or $v.FileSystem -ne 'NTFS') {
-        throw 'Requires a healthy, online, writable, non-clustered GPT disk and healthy NTFS C:.'
+    $style = [string]$d.PartitionStyle
+    if ($style -notin @('GPT','MBR')) { throw "Unsupported disk partition style: $style." }
+    if ($d.IsOffline -or $d.IsReadOnly -or $d.IsClustered -or $d.HealthStatus -ne 'Healthy') {
+        throw "Disk $($d.Number) must be healthy, online, writable and non-clustered."
     }
+    if ($v.HealthStatus -ne 'Healthy' -or $v.FileSystem -ne 'NTFS') { throw 'C: must be healthy NTFS.' }
     $parts = @(Get-Partition -DiskNumber $d.Number | Sort-Object Offset)
-    if ($parts.Count -ne 4 -or
-        ([string]$parts[0].GptType).Trim('{}') -ne 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' -or
-        ([string]$parts[1].GptType).Trim('{}') -ne 'e3c9e316-0b5c-4db8-817d-f92df00215ae' -or
-        $parts[2].PartitionNumber -ne $c.PartitionNumber -or
-        ([string]$c.GptType).Trim('{}') -ne $script:BasicType -or
-        ([string]$parts[3].GptType).Trim('{}') -ne $script:RecoveryType) {
-        throw 'Supported layout: EFI | MSR | C: | one Recovery partition | unallocated space.'
+    if ($style -eq 'GPT') {
+        if ($parts.Count -ne 4 -or
+            ([string]$parts[0].GptType).Trim('{}') -ne 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' -or
+            ([string]$parts[1].GptType).Trim('{}') -ne 'e3c9e316-0b5c-4db8-817d-f92df00215ae' -or
+            $parts[2].PartitionNumber -ne $c.PartitionNumber -or
+            ([string]$c.GptType).Trim('{}') -ne $script:BasicType -or
+            -not (Test-RecoveryType $parts[3] $style)) {
+            throw 'Supported GPT layout: EFI | MSR | C: | WinRE | unallocated space.'
+        }
+    } else {
+        # Exact three-primary-partition layout. Excludes dynamic, extended/logical and combined boot/C: layouts.
+        if ($d.Size -gt 2TB) { throw 'This tool restricts MBR disks to 2 TiB or less. No conversion is performed.' }
+        if ($parts.Count -ne 3 -or [int]$parts[0].MbrType -ne 7 -or
+            -not $parts[0].IsActive -or -not $parts[0].IsSystem -or $parts[0].IsBoot -or
+            $parts[1].PartitionNumber -ne $c.PartitionNumber -or [int]$c.MbrType -ne 7 -or
+            $c.IsActive -or -not (Test-RecoveryType $parts[2] $style)) {
+            throw 'Supported MBR layout: separate active system partition (0x07) | C: (0x07) | WinRE (0x27) | unallocated space. No logical/extended partitions.'
+        }
     }
-    $r = $parts[3]
-    if ($r.IsBoot -or $r.IsSystem -or $r.DriveLetter -or $r.Size -gt 2GB -or $r.Size -lt 300MB) {
-        throw 'Recovery partition does not match a standard, unmounted WinRE partition.'
+    $r = $parts[-1]
+    if ($r.IsBoot -or $r.IsSystem -or $r.IsActive -or $r.DriveLetter -or $r.Size -gt 2GB -or $r.Size -lt 300MB) {
+        throw 'Recovery must be an inactive, unlettered standard WinRE partition (300 MiB to 2 GiB).'
     }
-    if ([math]::Abs([double]$r.Offset - ($c.Offset + $c.Size)) -gt 1MB) {
-        throw 'Unexpected gap between C: and Recovery.'
-    }
+    if ([math]::Abs([double]$r.Offset - ($c.Offset + $c.Size)) -gt 1MB) { throw 'Unexpected gap between C: and Recovery.' }
+    if ($c.Offset % 1KB -ne 0) { throw 'C: offset is not supported by this tool (requires KiB alignment).' }
     $tail = [double]$d.Size - ($r.Offset + $r.Size)
     $gain = [math]::Floor(($tail + $r.Size - $script:Reserve - 2MB) / 1MB) * 1MB
-    if ($tail -lt 16MB -or $gain -lt 16MB) { throw 'No sufficient new trailing space. No resize is needed or possible.' }
-    $fingerprint = "$($d.UniqueId)|$($d.Size)|" + (($parts | ForEach-Object {
-        "$($_.Guid):$($_.PartitionNumber):$($_.Offset):$($_.Size)"
-    }) -join '|')
-    [pscustomobject]@{ Disk=$d; C=$c; Recovery=$r; Parts=$parts; Gain=$gain; Fingerprint=$fingerprint }
+    if ($tail -lt 16MB -or $gain -lt 16MB) { throw 'Insufficient trailing space for growth and the reserved Recovery partition.' }
+    $diskKey = Get-DiskKey $d
+    $fingerprint = $diskKey + '|' + (($parts | ForEach-Object { Get-PartitionKey $_ $style }) -join '|')
+    [pscustomobject]@{ Disk=$d; DiskKey=$diskKey; Style=$style; C=$c; Recovery=$r; Parts=$parts; Gain=$gain; Fingerprint=$fingerprint }
 }
 function Invoke-DiskPart([int]$DiskNumber, [int]$PartitionNumber, [string]$Command) {
     $path = Join-Path $script:RunDir ('diskpart-' + [guid]::NewGuid().ToString('N') + '.txt')
-    Write-Log ("DiskPart commands:`r`nselect disk $DiskNumber`r`nselect partition $PartitionNumber`r`n$Command`r`nexit")
-    @("select disk $DiskNumber", "select partition $PartitionNumber", $Command, 'exit') |
-        Set-Content -LiteralPath $path -Encoding ASCII
+    $commands = @("select disk $DiskNumber")
+    if ($PartitionNumber -gt 0) { $commands += "select partition $PartitionNumber" }
+    $commands += @($Command, 'exit')
+    Write-Log ("DiskPart commands:`r`n" + ($commands -join "`r`n"))
+    $commands | Set-Content -LiteralPath $path -Encoding ASCII
     Invoke-Native "$env:windir\System32\diskpart.exe" @('/s', $path)
 }
 
+function Read-BitLockerVolume {
+    # Prefer the supported PowerShell module, but do not require ServerManager.
+    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+        try {
+            Write-Log '> Get-BitLockerVolume -MountPoint C:'
+            $volumes = @(Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop)
+            if ($volumes.Count -ne 1) { throw 'Expected one BitLocker volume for C:.' }
+            $volume = $volumes[0]
+            if ($null -eq $volume.VolumeStatus -or $null -eq $volume.ProtectionStatus -or
+                $null -eq $volume.EncryptionPercentage -or $null -eq $volume.LockStatus) {
+                throw 'BitLocker PowerShell returned incomplete status.'
+            }
+            return $volume
+        } catch {
+            Write-Log ('BitLocker PowerShell status unavailable; trying CIM: ' + $_.Exception.Message)
+        }
+    }
+    Write-Log '> CIM Win32_EncryptableVolume (C:): GetConversionStatus, GetProtectionStatus, GetLockStatus'
+    try {
+        $volumes = @(Get-CimInstance -Namespace 'root/CIMV2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='C:'" -ErrorAction Stop)
+        if ($volumes.Count -ne 1) { throw 'C: was not uniquely identified by the BitLocker provider.' }
+        $volume = $volumes[0]
+        $conversion = Invoke-CimMethod -InputObject $volume -MethodName GetConversionStatus -Arguments @{PrecisionFactor=[uint32]0} -ErrorAction Stop
+        $protection = Invoke-CimMethod -InputObject $volume -MethodName GetProtectionStatus -ErrorAction Stop
+        $lock = Invoke-CimMethod -InputObject $volume -MethodName GetLockStatus -ErrorAction Stop
+        foreach ($result in @($conversion,$protection,$lock)) {
+            if ($null -eq $result.ReturnValue -or $result.ReturnValue -ne 0) { throw 'BitLocker provider returned a failed method result.' }
+        }
+        $conversionNames = @('FullyDecrypted','FullyEncrypted','EncryptionInProgress','DecryptionInProgress','EncryptionPaused','DecryptionPaused')
+        if ($null -eq $conversion.ConversionStatus -or $conversion.ConversionStatus -notin 0..5 -or
+            $null -eq $conversion.EncryptionPercentage -or $conversion.EncryptionPercentage -gt 100 -or
+            $null -eq $protection.ProtectionStatus -or $protection.ProtectionStatus -notin 0..1 -or
+            $null -eq $lock.LockStatus -or $lock.LockStatus -notin 0..1) {
+            throw 'BitLocker provider returned unknown or incomplete status.'
+        }
+        return [pscustomobject]@{
+            MountPoint='C:'
+            VolumeStatus=$conversionNames[[int]$conversion.ConversionStatus]
+            EncryptionPercentage=[int]$conversion.EncryptionPercentage
+            ProtectionStatus=@('Off','On')[[int]$protection.ProtectionStatus]
+            LockStatus=@('Unlocked','Locked')[[int]$lock.LockStatus]
+        }
+    } catch {
+        Write-Log ('BitLocker CIM status unavailable: ' + $_.Exception.Message)
+        Write-Log 'No status was inferred from a missing command/module/provider. Diagnose the BitLocker management components; if available, collect: manage-bde -status C:'
+        throw 'Cannot verify BitLocker state. Changes remain blocked; see the log for the provider error.'
+    }
+}
 function Get-EncryptionState {
     Set-Summary 'BitLocker' 'BitLocker C: Unknown / checking - see log if this check fails.' 'DarkOrange'
-    Write-Log '> Get-WindowsFeature BitLocker; Get-BitLockerVolume -MountPoint C:'
-    $feature = Get-WindowsFeature -Name BitLocker
-    if ($null -eq $feature) { throw 'BitLocker feature state is unknown; changes remain blocked.' }
-    if (-not $feature.Installed) {
-        Set-Summary 'BitLocker' "BitLocker: Feature not installed | Checked $(Get-Date -Format HH:mm:ss)" 'DarkGreen'
-        Write-Log 'BitLocker feature is not installed. No BitLocker handling required for this supported server configuration.'
-        return
-    }
+    # Feature inspection is optional and only runs where ServerManager exposes it.
+    if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+        try {
+            Write-Log '> Get-WindowsFeature -Name BitLocker (optional server feature check)'
+            $feature = Get-WindowsFeature -Name BitLocker -ErrorAction Stop
+            if ($null -ne $feature -and $feature.Installed -eq $false) {
+                Set-Summary 'BitLocker' "BitLocker: Feature not installed | Checked $(Get-Date -Format HH:mm:ss)" 'DarkGreen'
+                Write-Log 'Server feature query confirms BitLocker is not installed.'
+                return
+            }
+        } catch { Write-Log ('Server feature check unavailable; checking the volume directly: ' + $_.Exception.Message) }
+    } else { Write-Log 'Get-WindowsFeature unavailable; checking C: directly. No ServerManager installation is required by this check.' }
     # Do not print KeyProtector objects or recovery passwords into logs.
-    $b = Get-BitLockerVolume -MountPoint 'C:'
-    if ($null -eq $b) { throw 'Cannot read BitLocker state. Changes remain blocked.' }
+    $b = Read-BitLockerVolume
     Set-Summary 'BitLocker' "BitLocker C: $($b.VolumeStatus) ($($b.EncryptionPercentage)%) | Protection: $($b.ProtectionStatus) | $($b.LockStatus) | Checked $(Get-Date -Format HH:mm:ss)" 'DarkOrange'
     $b | Select-Object MountPoint,VolumeStatus,ProtectionStatus,EncryptionPercentage,LockStatus | Format-List | Out-String | Write-Log
-    if ([string]$b.VolumeStatus -ne 'FullyDecrypted' -or $b.EncryptionPercentage -ne 0 -or [string]$b.LockStatus -ne 'Unlocked') {
+    if ([string]$b.VolumeStatus -ne 'FullyDecrypted' -or $b.EncryptionPercentage -ne 0 -or [string]$b.LockStatus -ne 'Unlocked' -or [string]$b.ProtectionStatus -ne 'Off') {
         Write-Log @'
 BITLOCKER GUIDANCE
 This tool only permits fully decrypted C:. That is a limitation of this tool,
@@ -171,6 +270,7 @@ ProtectionStatus Off can mean suspended protection; the data may still be encryp
    Disable-BitLocker -MountPoint 'C:'
 4. Monitor without displaying keys:
    Get-BitLockerVolume -MountPoint 'C:' | Select MountPoint,VolumeStatus,ProtectionStatus,EncryptionPercentage
+   If that cmdlet is unavailable, use: manage-bde -status C:
 5. Wait for FullyDecrypted / 0%, then repeat the BitLocker check in this tool.
 6. If decrypted, re-enable BitLocker afterward using your organization's policy and
    escrow process. This GUI neither decrypts nor re-encrypts the disk automatically.
@@ -196,16 +296,19 @@ function Assert-OriginalLayout {
 function Show-Partitions {
     $c = Get-Partition -DriveLetter C
     $rows = @(Get-Partition -DiskNumber $c.DiskNumber | Sort-Object Offset)
+    $d = Get-Disk -Number $c.DiskNumber
+    Write-Log "Disk $($d.Number): $($d.PartitionStyle) partition style"
     $grid.Rows.Clear()
     foreach ($p in $rows) {
+        $displayType = if ($d.PartitionStyle -eq 'MBR') { 'MBR 0x{0:X2}' -f [int]$p.MbrType } else { [string]$p.GptType }
         [void]$grid.Rows.Add($c.DiskNumber,$p.PartitionNumber,[string]$p.DriveLetter,[string]$p.Type,
-            ('{0:N3}' -f ($p.Size/1GB)),[string]$p.GptType)
+            ('{0:N3}' -f ($p.Size/1GB)),$displayType)
     }
     $d = Get-Disk -Number $c.DiskNumber
     # Force the Double overload: an untyped 0 can select Int32 and overflow above 2 GiB.
     $tail = [math]::Max([double]0, ([double]$d.Size - [double]$rows[-1].Offset - [double]$rows[-1].Size - [double]1MB))
     [void]$grid.Rows.Add($d.Number,'-','','Trailing free (approx.)',('{0:N3}' -f ($tail/1GB)),'')
-    $rows | Select-Object PartitionNumber,DriveLetter,Type,Size,Offset,GptType | Format-Table -AutoSize | Out-String | Write-Log
+    $rows | Select-Object PartitionNumber,DriveLetter,Type,Size,Offset,GptType,MbrType,IsActive | Format-Table -AutoSize | Out-String | Write-Log
 }
 function Step-Inspect {
     Assert-Phase @('Start','Inspected','Matched','Ready')
@@ -216,6 +319,7 @@ function Step-Inspect {
     Show-Partitions
     $script:Plan = Get-Layout
     $script:Phase = 'Inspected'
+    Write-Log "Selected workflow: $($script:Plan.Style). The existing boot/system partition(s) will be preserved."
     Write-Log ('Layout accepted. Disk {0}, C: partition {1}, Recovery candidate {2}.' -f $script:Plan.Disk.Number,$script:Plan.C.PartitionNumber,$script:Plan.Recovery.PartitionNumber)
     Write-Log ('Proposed C: {0:N2} -> approximately {1:N2} GiB; Recovery: 1 GiB.' -f ($script:Plan.C.Size/1GB),(($script:Plan.C.Size+$script:Plan.Gain)/1GB))
     Write-Log 'Next: compare the candidate with the active WinRE location. A Recovery type alone is insufficient.'
@@ -231,7 +335,7 @@ function Step-Match {
         throw 'MISMATCH: the partition blocking C: is not the active WinRE partition. Deletion is blocked.'
     }
     Set-Summary 'WinRE' "WinRE: Enabled | Disk $($re.Disk), partition $($re.Partition) | Recovery match verified | Checked $(Get-Date -Format HH:mm:ss)" 'DarkGreen'
-    Write-Log "MATCH: active WinRE is disk $($re.Disk), partition $($re.Partition); GPT recovery type also matches."
+    Write-Log "MATCH: active WinRE is disk $($re.Disk), partition $($re.Partition); partition recovery type also matches."
     $script:Phase = 'Matched'
 }
 function Step-BitLocker {
@@ -252,7 +356,7 @@ function Step-Disable {
     Step-BitLocker
     $fresh = Assert-OriginalLayout
     $fresh.Parts | Select-Object * | Export-Clixml (Join-Path $script:RunDir 'partitions-before.xml')
-    if ((Get-Volume -DriveLetter C).SizeRemaining -lt 3GB) { throw 'At least 3 GiB free on C: is required before preserving the recovery image.' }
+    if ((Get-Volume -DriveLetter C).SizeRemaining -lt 1GB) { throw 'At least 1 GiB free on C: is required before preserving the recovery image.' }
     $script:Phase = 'DisableUncertain'
     Invoke-Native "$env:windir\System32\reagentc.exe" @('/disable') | Out-Null
     if ((Get-ReInfo).Enabled) { throw 'WinRE is still enabled. No partition was deleted.' }
@@ -284,17 +388,19 @@ function Step-Extend {
     $stage = 'Recovery identity verification'
     try {
         $r = Get-Partition -DiskNumber $fresh.Disk.Number -PartitionNumber $fresh.Recovery.PartitionNumber
-        if ($r.Guid -ne $fresh.Recovery.Guid -or $r.Offset -ne $fresh.Recovery.Offset -or $r.Size -ne $fresh.Recovery.Size) {
+        if ((Get-PartitionKey $r $fresh.Style) -ne (Get-PartitionKey $fresh.Recovery $fresh.Style)) {
             throw 'Recovery partition changed before deletion.'
         }
+        Assert-DiskIdentity $fresh
         $stage = 'Delete original Recovery partition'
         $script:DestructiveStarted = $true
         $script:Phase = 'Blocked'
         Invoke-DiskPart $fresh.Disk.Number $r.PartitionNumber 'delete partition override' | Out-Null
         $remaining = @(Get-Partition -DiskNumber $fresh.Disk.Number)
-        if ($remaining.Count -ne 3 -or @($remaining | Where-Object Guid -eq $r.Guid).Count -ne 0) {
+        if ($remaining.Count -ne ($fresh.Parts.Count - 1) -or @($remaining | Where-Object PartitionNumber -eq $r.PartitionNumber).Count -ne 0) {
             throw 'Recovery deletion was not verified; refusing to resize.'
         }
+        Assert-Preserved $fresh $remaining
         $stage = 'Extend C:'
         $limit = Get-PartitionSupportedSize -DriveLetter C
         $target = [uint64]([math]::Floor(($limit.SizeMax - $script:Reserve) / 1MB) * 1MB)
@@ -302,19 +408,41 @@ function Step-Extend {
         Write-Log " > Resize-Partition -DriveLetter C -Size $target"
         Resize-Partition -DriveLetter C -Size $target
         $cNow = Get-Partition -DriveLetter C
-        if ($cNow.Size -ne $target -or $cNow.Guid -ne $fresh.C.Guid) { throw 'C: resize verification failed.' }
+        if ($cNow.Size -ne $target -or (Get-PartitionKey $cNow $fresh.Style -IgnoreSize) -ne (Get-PartitionKey $fresh.C $fresh.Style -IgnoreSize)) { throw 'C: resize verification failed.' }
         $stage = 'Create and format new Recovery partition'
-        Write-Log " > New-Partition -DiskNumber $($fresh.Disk.Number) -Offset $($cNow.Offset + $cNow.Size) -Size $script:Reserve -GptType {$script:RecoveryType}"
-        $new = New-Partition -DiskNumber $fresh.Disk.Number -Offset ($cNow.Offset + $cNow.Size) -Size $script:Reserve -GptType "{$script:RecoveryType}"
-        if ($null -eq $new -or $new.Size -ne $script:Reserve -or $new.Offset -ne ($cNow.Offset + $cNow.Size) -or
-            $new.IsBoot -or $new.IsSystem -or ([string]$new.GptType).Trim('{}') -ne $script:RecoveryType) {
+        Assert-DiskIdentity $fresh
+        $newOffset = [uint64]($cNow.Offset + $cNow.Size)
+        $beforeCreate = @(Get-Partition -DiskNumber $fresh.Disk.Number)
+        if ($fresh.Style -eq 'GPT') {
+            Write-Log " > New-Partition: GPT Recovery, offset $newOffset, size $script:Reserve"
+            $created = New-Partition -DiskNumber $fresh.Disk.Number -Offset $newOffset -Size $script:Reserve -GptType "{$script:RecoveryType}"
+        } else {
+            # DiskPart offset is KiB; id=27 is hexadecimal (decimal 39).
+            $offsetKiB = [uint64]($newOffset / 1KB)
+            Invoke-DiskPart $fresh.Disk.Number 0 "create partition primary size=1024 offset=$offsetKiB id=27" | Out-Null
+        }
+        $afterCreate = @(Get-Partition -DiskNumber $fresh.Disk.Number)
+        $candidates = @($afterCreate | Where-Object { $_.Offset -eq $newOffset -and $_.PartitionNumber -notin $beforeCreate.PartitionNumber })
+        if ($afterCreate.Count -ne $fresh.Parts.Count -or $candidates.Count -ne 1) { throw 'New partition creation was not verified; no format performed.' }
+        Assert-Preserved $fresh $afterCreate -AllowCGrowth
+        $new = $candidates[0]
+        if ($new.Size -ne $script:Reserve -or $new.IsBoot -or $new.IsSystem -or $new.IsActive -or $new.DriveLetter -or -not (Test-RecoveryType $new $fresh.Style)) {
             throw 'New partition identity check failed; no format performed.'
         }
-        Write-Log " > Format-Volume: ONLY newly created disk $($fresh.Disk.Number), partition $($new.PartitionNumber), GUID $($new.Guid); NTFS; Windows RE tools"
+        Write-Log " > Format-Volume: ONLY new disk $($fresh.Disk.Number), partition $($new.PartitionNumber); NTFS; Windows RE tools"
         Format-Volume -Partition $new -FileSystem NTFS -NewFileSystemLabel 'Windows RE tools' -Confirm:$false | Out-Null
-        Invoke-DiskPart $fresh.Disk.Number $new.PartitionNumber 'gpt attributes=0x8000000000000001' | Out-Null
-        $details = Invoke-DiskPart $fresh.Disk.Number $new.PartitionNumber 'detail partition'
-        if ($details -notmatch '8000000000000001') { throw 'Required Recovery attributes were not verified.' }
+        if ($fresh.Style -eq 'GPT') {
+            Invoke-DiskPart $fresh.Disk.Number $new.PartitionNumber 'gpt attributes=0x8000000000000001' | Out-Null
+            $details = Invoke-DiskPart $fresh.Disk.Number $new.PartitionNumber 'detail partition'
+            if ($details -notmatch '8000000000000001') { throw 'Required GPT Recovery attributes were not verified.' }
+        } else {
+            # Reapply after formatting, as specified in Microsoft's MBR WinRE procedure.
+            Invoke-DiskPart $fresh.Disk.Number $new.PartitionNumber 'set id=27 override' | Out-Null
+        }
+        $new = Get-Partition -DiskNumber $fresh.Disk.Number -PartitionNumber $new.PartitionNumber
+        if ($new.Offset -ne $newOffset -or $new.Size -ne $script:Reserve -or $new.IsActive -or $new.DriveLetter -or -not (Test-RecoveryType $new $fresh.Style)) {
+            throw 'Recovery type/size/offset/active-state verification failed after formatting.'
+        }
         $script:NewRecovery = $new
         $script:Phase = 'Rebuilt'
         Show-Partitions
@@ -331,10 +459,11 @@ function Step-Extend {
 function Step-Enable {
     Assert-Phase @('Disabled','DisableUncertain','Rebuilt','Done')
     if ($script:Phase -eq 'Done') { Test-Final; return }
+    Assert-DiskIdentity $script:Plan
     $rebuilt = $script:Phase -eq 'Rebuilt'
     if ($rebuilt) {
         $new = Get-Partition -DiskNumber $script:Plan.Disk.Number -PartitionNumber $script:NewRecovery.PartitionNumber
-        if ($new.Guid -ne $script:NewRecovery.Guid -or $new.Offset -ne $script:NewRecovery.Offset -or $new.Size -ne $script:Reserve) {
+        if ((Get-PartitionKey $new $script:Plan.Style) -ne (Get-PartitionKey $script:NewRecovery $script:Plan.Style)) {
             throw 'New Recovery identity changed. Enable is blocked pending manual review.'
         }
         $expectedNumber = $new.PartitionNumber
@@ -369,13 +498,12 @@ function Test-Final {
             throw 'Recovery volume health/free-space validation failed.'
         }
         $after = @(Get-Partition -DiskNumber $fresh.Disk.Number | Sort-Object Offset)
-        if ($after.Count -ne 4) { throw 'Unexpected final partition count.' }
-        foreach ($original in $fresh.Parts[0..1]) {
-            $same = @($after | Where-Object Guid -eq $original.Guid)
-            if ($same.Count -ne 1 -or $same[0].Offset -ne $original.Offset -or $same[0].Size -ne $original.Size) {
-                throw 'EFI/MSR identity validation failed.'
-            }
-        }
+        Assert-DiskIdentity $fresh
+        if ($after.Count -ne $fresh.Parts.Count) { throw 'Unexpected final partition count.' }
+        Assert-Preserved $fresh $after -AllowCGrowth
+        $actualRecovery = Get-Partition -DiskNumber $fresh.Disk.Number -PartitionNumber $new.PartitionNumber
+        if ((Get-PartitionKey $actualRecovery $fresh.Style) -ne (Get-PartitionKey $new $fresh.Style) -or
+            -not (Test-RecoveryType $actualRecovery $fresh.Style)) { throw 'Final Recovery identity/type validation failed.' }
         $cv = Get-Volume -DriveLetter C
         if ($cv.HealthStatus -ne 'Healthy') { throw 'C: health validation failed.' }
         $after | Select-Object PartitionNumber,DriveLetter,Type,Size | Out-String | Write-Log
@@ -435,20 +563,20 @@ $script:StateHelp = @{
     Blocked='Partial changes possible. Manual recovery review required; automatic changes blocked.'
 }
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'Extend C: - guided and quick workflows'
+$form.Text = 'Extend C: v2.3.1 - GPT / MBR - guided and quick workflows'
 $form.Size = New-Object System.Drawing.Size(1080,900)
 $form.MinimumSize = $form.Size
 $form.StartPosition = 'CenterScreen'
 $form.Font = New-Object System.Drawing.Font('Segoe UI',10)
 $intro = New-Object System.Windows.Forms.Label
 $intro.SetBounds(18,12,1020,45)
-$intro.Text = "Extend C: while keeping a 1 GiB Windows Recovery partition. No reboot is requested.`r`nUse a recoverable VM backup. Standard GPT / NTFS / WinRE only. Test on a clone before production."
+$intro.Text = "Extend C: while keeping a 1 GiB Windows Recovery partition. No reboot is requested.`r`nUse a recoverable VM backup. Standard GPT or MBR / NTFS / WinRE only. Test on a clone before production."
 $grid = New-Object System.Windows.Forms.DataGridView
 $grid.SetBounds(18,62,1020,162)
 $grid.ReadOnly=$true; $grid.AllowUserToAddRows=$false; $grid.AllowUserToDeleteRows=$false
 $grid.RowHeadersVisible=$false; $grid.AutoSizeColumnsMode='Fill'; $grid.BackgroundColor=[Drawing.Color]::White
 $grid.Anchor='Top,Left,Right'
-foreach ($name in @('Disk','Partition','Letter','Type','GiB','GPT type GUID')) { [void]$grid.Columns.Add($name,$name) }
+foreach ($name in @('Disk','Partition','Letter','Type','GiB','Partition type (GPT / MBR)')) { [void]$grid.Columns.Add($name,$name) }
 $grid.Columns[5].FillWeight=280
 $tabs = New-Object System.Windows.Forms.TabControl
 $tabs.SetBounds(18,233,1020,312); $tabs.Anchor='Top,Left,Right'
